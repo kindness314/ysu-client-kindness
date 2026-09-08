@@ -20,7 +20,12 @@ export function parseLooseJson(input: string): unknown {
   if (typeof input !== "string" || input.length > LOOSE_JSON_MAX_LEN) {
     throw new Error("parseLooseJson: input too large or not a string")
   }
-  const pre = input.replace(/([{\[,])(\s*)([A-Za-z_$][\w$]*)(\s*:)/g, '$1$2"$3"$4')
+  // Skip quoted strings as whole tokens: key-like text inside a value is data.
+  const pre = input.replace(
+    /"(?:[^"\\]|\\[\s\S])*"|([{\[,]\s*)([A-Za-z_$][\w$]*)(\s*:)/g,
+    (token, prefix: string | undefined, key: string, colon: string) =>
+      prefix === undefined ? token : `${prefix}"${key}"${colon}`
+  )
   return JSON.parse(pre)
 }
 

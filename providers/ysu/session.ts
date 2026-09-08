@@ -41,6 +41,9 @@ import { withAuthTransition } from "./auth-transition"
 
 /** 从 auth-store 恢复 CAS 凭据、JWXT 会话和 mobile 会话到各自的 jar。 */
 export async function initializeSession(): Promise<void> {
+  // Fee sessions are derived from CAS and must never survive credential restoration.
+  resetEpay()
+  resetEcard()
   // 从 settings-store 初始化自定义服务器地址
   initServerConfig()
   // 清理因 credential 轮换产生的孤立缓存

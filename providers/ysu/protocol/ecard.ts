@@ -16,6 +16,7 @@ const BASE_URL = "https://ehall.ysu.edu.cn"
 const SERVICE_PATH = "/publicapp/sys/myyktzd/index.do"
 /** 一卡通账单主数据（含余额）。 */
 const BALANCE_PATH = "/publicapp/sys/myyktzd/mySmartCard/loadSmartCardBillMain.do"
+const RESPONSE_STATUS_KEYS = ["code", "status"] as const
 
 // ─── Types ────────────────────────────────────────────────────────────── //
 
@@ -62,6 +63,7 @@ let ecardJar = new SimpleCookieJar()
 let timeoutMs = 30_000
 let authorized = false
 let inflightAuth: Promise<void> | null = null
+let authorizationGeneration = 0
 
 export function getJar(): SimpleCookieJar {
   return ecardJar
@@ -77,24 +79,32 @@ export function resetEcard(): void {
   inflightAuth = null
 }
 
-function repr(e: unknown): string {
-  return e instanceof Error ? e.message : String(e)
+function assertCurrentSession(jar: SimpleCookieJar): void {
+  if (jar !== ecardJar) {
+    throw new EcardProtocolError("ecard session changed during request")
+  }
 }
 
 // ─── Auth & low-level requests ────────────────────────────────────────── //
 
-async function ensureAuthorized(): Promise<void> {
+async function ensureAuthorized(jar: SimpleCookieJar): Promise<void> {
   await waitForAuthTransition()
+  assertCurrentSession(jar)
   if (authorized) return
   await getCredentialApplied()
+  assertCurrentSession(jar)
   if (inflightAuth) {
     await inflightAuth
+    assertCurrentSession(jar)
     return
   }
 
   const promise = withAuthTransition(async () => {
+    assertCurrentSession(jar)
     if (authorized) return
-    await authorize(`${BASE_URL}${SERVICE_PATH}`, ecardJar)
+    await authorize(`${BASE_URL}${SERVICE_PATH}`, jar)
+    assertCurrentSession(jar)
+    authorizationGeneration += 1
     authorized = true
   })
 
@@ -106,40 +116,48 @@ async function ensureAuthorized(): Promise<void> {
   }
 }
 
-async function runWithReauth<T>(fn: () => Promise<T>): Promise<T> {
-  await ensureAuthorized()
-  try {
-    return await fn()
-  } catch (e) {
-    if (e instanceof EcardNotLoggedInError) {
-      authorized = false
-      await ensureAuthorized()
-      await waitForAuthTransition()
-      return await fn()
+async function runWithReauth<T>(fn: (jar: SimpleCookieJar) => Promise<T>): Promise<T> {
+  const jar = ecardJar
+  for (let attempt = 0; ; attempt += 1) {
+    await ensureAuthorized(jar)
+    const requestGeneration = authorizationGeneration
+    try {
+      const result = await fn(jar)
+      assertCurrentSession(jar)
+      return result
+    } catch (e) {
+      assertCurrentSession(jar)
+      if (!(e instanceof EcardNotLoggedInError)) throw e
+      // A late failure from the previous session must not invalidate a newer authorization.
+      if (requestGeneration === authorizationGeneration) authorized = false
+      if (attempt > 0) throw e
     }
-    throw e
   }
 }
 
-function isLoginPage(text: string): boolean {
-  const t = text.slice(0, 600)
-  return /authserver|身份认证|请输入用户名/.test(t)
-}
 
 // ─── Parsing helpers ──────────────────────────────────────────────────── //
 
 function asRecord(v: unknown): Record<string, unknown> {
-  return v !== null && typeof v === "object" ? (v as Record<string, unknown>) : {}
+  return v !== null && typeof v === "object" && !Array.isArray(v)
+    ? (v as Record<string, unknown>)
+    : {}
 }
 
 function str(v: unknown): string {
-  if (v === null || v === undefined) return ""
-  return String(v)
+  return typeof v === "string" || typeof v === "number" ? String(v) : ""
 }
 
-function num(v: unknown): number {
-  const n = typeof v === "number" ? v : Number(v)
-  return Number.isFinite(n) ? n : 0
+function parseBalance(value: unknown): number {
+  if (
+    typeof value !== "number" &&
+    (typeof value !== "string" || !/^[+-]?\d+(?:\.\d+)?$/.test(value.trim()))
+  ) {
+    throw new EcardProtocolError("invalid ecard balance")
+  }
+  const balance = Number(value)
+  if (!Number.isFinite(balance)) throw new EcardProtocolError("invalid ecard balance")
+  return balance
 }
 
 /**
@@ -153,15 +171,15 @@ export function toEcardBalance(body: unknown): EcardBalance | null {
   const balanceRaw = root.remining ?? datas.KNYE
   const availRaw = root.availdate ?? datas.KYXQ
   const statusRaw = root.cardstatusname ?? datas.MC
-  const cardNum = str(root.cardnum ?? root.id ?? datas.KH)
-  if (balanceRaw === undefined && availRaw === undefined) return null
+  const cardNum = str(root.cardnum ?? datas.KH ?? root.id)
+  if (balanceRaw === undefined || balanceRaw === null) return null
 
   const months = Array.isArray(root.yearMonths)
     ? root.yearMonths.map((m) => str(m)).filter(Boolean)
     : []
 
   return {
-    balance: num(balanceRaw),
+    balance: parseBalance(balanceRaw),
     cardNum,
     availableDate: str(availRaw),
     cardStatusName: str(statusRaw),
@@ -173,41 +191,72 @@ export function toEcardBalance(body: unknown): EcardBalance | null {
 
 /** 查询一卡通余额。 */
 export async function getEcardBalance(): Promise<EcardSessionStatus> {
-  return runWithReauth(async () => {
-    const url = `${BASE_URL}${BALANCE_PATH}`
+  return runWithReauth(async (jar) => {
     let resp: HttpResponse
     try {
-      resp = await fetchWithJar(ecardJar, {
+      resp = await fetchWithJar(jar, {
         method: "POST",
-        url,
-        redirect: "follow",
+        url: `${BASE_URL}${BALANCE_PATH}`,
+        redirect: "manual",
         timeoutMs,
         headers: {
           Accept: "application/json, text/plain, */*",
           "X-Requested-With": "XMLHttpRequest",
         },
       })
-    } catch (e) {
-      throw new EcardProtocolError(`request failed for ${url}: ${repr(e)}`)
+    } catch {
+      throw new EcardProtocolError("ecard request failed")
     }
-    // 校验最终落地 URL：跟随重定向后必须仍落在 ehall API 域（防被踢回登录/外部域）。
-    // resp.url 在部分运行时（CapacitorHttp）可能为空，空值不误判，交由响应体检查兜底。
-    if (resp.url && (!resp.url.startsWith(BASE_URL) || isLoginPage(resp.url))) {
-      throw new EcardNotLoggedInError(`redirected away from API: ${resp.url}`)
+    if ((resp.status >= 300 && resp.status < 400) || resp.status === 401 || resp.status === 403) {
+      throw new EcardNotLoggedInError("ecard session expired")
+    }
+    if (resp.status < 200 || resp.status >= 300) {
+      throw new EcardProtocolError(`ecard HTTP ${resp.status}`)
+    }
+    // Native transports can report a final URL even when manual redirects were requested.
+    if (resp.url) {
+      let finalUrl: URL
+      try {
+        finalUrl = new URL(resp.url)
+      } catch {
+        throw new EcardProtocolError("invalid ecard response URL")
+      }
+      if (finalUrl.origin !== BASE_URL || finalUrl.pathname !== BALANCE_PATH) {
+        throw new EcardNotLoggedInError("ecard response left the balance endpoint")
+      }
     }
     const text = await resp.text()
-    if (isLoginPage(text)) {
-      throw new EcardNotLoggedInError(`redirected to login page: ${url}`)
-    }
-    if (resp.status >= 400) {
-      throw new EcardProtocolError(`HTTP ${resp.status} from ${url}`)
+    if (/authserver|reAuthCheck|isMultifactor|身份认证|请输入用户名/i.test(text)) {
+      throw new EcardNotLoggedInError("ecard response requires login")
     }
     let parsed: unknown
     try {
       parsed = parseLooseJson(text)
     } catch {
-      throw new EcardProtocolError(`non-JSON response from ${url}`)
+      throw new EcardProtocolError("non-JSON ecard response")
     }
-    return { ready: true, balance: toEcardBalance(parsed) }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new EcardProtocolError("invalid ecard response")
+    }
+    const body = asRecord(parsed)
+    for (const key of RESPONSE_STATUS_KEYS) {
+      const code = body[key]
+      if (code === 401 || code === "401" || code === 403 || code === "403") {
+        throw new EcardNotLoggedInError("ecard session expired")
+      }
+      if (code !== undefined && code !== null && code !== 200 && code !== "200") {
+        throw new EcardProtocolError("ecard balance query was rejected")
+      }
+    }
+    if (body.success === false) throw new EcardProtocolError("ecard balance query was rejected")
+    if (
+      !("datas" in body) &&
+      !("remining" in body) &&
+      str(body.code) !== "200" &&
+      str(body.status) !== "200"
+    ) {
+      throw new EcardProtocolError("unrecognized ecard response")
+    }
+    return { ready: true, balance: toEcardBalance(body) }
   })
 }

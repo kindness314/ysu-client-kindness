@@ -1,61 +1,94 @@
 "use client"
 
-import { useCallback, useEffect, useState } from "react"
+import { useCallback } from "react"
+import useSWR from "swr"
 import { CreditCard, RefreshCw } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Alert, AlertDescription } from "@/components/ui/alert"
+import { Card, CardContent } from "@/components/ui/card"
 import { Empty, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty"
 import { Skeleton } from "@/components/ui/skeleton"
 import { useTranslation } from "@/lib/i18n/use-translation"
 import { useAuthStore } from "@/lib/stores/auth"
 import { useMobileHeaderRight } from "@/lib/stores/mobile-header"
-import { fetchEcardBalance, type EcardBalance } from "@/providers/ysu/ecard-access"
+import { fetchEcardBalance, type EcardSessionStatus } from "@/providers/ysu/ecard-access"
+import { ProviderError, ProviderErrorCode } from "@/providers/errors"
+import { providerQueryKey } from "@/providers/hooks/use-provider-query"
+import { useProvider, useProviderReady } from "@/providers/use-provider"
+import { getSchoolConfigScope } from "@/lib/server-config"
 import { cn } from "@/lib/utils"
 
 export default function EcardPage() {
   const { t } = useTranslation()
+  const provider = useProvider()
+  const isReady = useProviderReady()
   const hasHydrated = useAuthStore((s) => s.hasHydrated)
   const username = useAuthStore((s) => s.username)
 
-  const [balance, setBalance] = useState<EcardBalance | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  const [loading, setLoading] = useState(false)
-  const [noAuth, setNoAuth] = useState(false)
-
-  const load = useCallback(async () => {
-    setLoading(true)
-    try {
-      const status = await fetchEcardBalance()
-      setBalance(status.balance)
-      setError(null)
-      setNoAuth(false)
-    } catch (e) {
-      const isAuthErr = e instanceof Error && e.name === "EcardAccessError"
-      if (isAuthErr) {
-        setNoAuth(true)
-        setError(null)
-        setBalance(null)
-      } else {
-        // 只展示友好文案，原始错误（含内部 URL/细节）仅记日志，避免泄露
-        console.error("ecard query failed:", e)
-        setError(t("ecard.loadFailed", { message: t("ecard.errorGeneric") }))
+  const credential = useAuthStore((s) => s.credential)
+  const isAuthenticated = useAuthStore((s) => s.isAuthenticated)
+  const schoolConfigScope = getSchoolConfigScope()
+  const enabled = isReady && hasHydrated && !!username && !!credential && isAuthenticated
+  const { data, error: queryError, isLoading, isValidating, mutate } = useSWR<
+    EcardSessionStatus,
+    ProviderError
+  >(
+    enabled
+      ? providerQueryKey(provider.id, schoolConfigScope, username, "ecard", { credential })
+      : null,
+    async () => {
+      const account = useAuthStore.getState()
+      if (
+        account.username !== username ||
+        account.credential !== credential ||
+        getSchoolConfigScope() !== schoolConfigScope
+      ) {
+        throw new ProviderError(ProviderErrorCode.AUTH_REQUIRED, "一卡通查询账户已切换")
       }
-    } finally {
-      setLoading(false)
-    }
-  }, [t])
-
-  useEffect(() => {
-    if (hasHydrated && username) void load()
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- 学号就绪时首拉一次
-  }, [hasHydrated, username])
+      const status = await fetchEcardBalance()
+      const current = useAuthStore.getState()
+      if (
+        current.username !== username ||
+        current.credential !== credential ||
+        getSchoolConfigScope() !== schoolConfigScope
+      ) {
+        throw new ProviderError(ProviderErrorCode.AUTH_REQUIRED, "一卡通查询账户已切换")
+      }
+      return status
+    },
+    { revalidateOnFocus: false, shouldRetryOnError: false, keepPreviousData: false }
+  )
+  const balance = enabled ? data?.balance ?? null : null
+  const loading = isLoading || isValidating
+  const noAuth =
+    !isAuthenticated ||
+    !credential ||
+    queryError?.code === ProviderErrorCode.AUTH_REQUIRED ||
+    queryError?.code === ProviderErrorCode.AUTH_SESSION_EXPIRED
+  const error = queryError
+    ? noAuth ? t("ecard.noAuth") : t("ecard.loadFailed", { message: t("ecard.errorGeneric") })
+    : null
+  const load = useCallback(async () => {
+    if (!enabled) return
+    // SWR retains the error for rendering, including when stale data is still available.
+    await mutate().catch(() => undefined)
+  }, [enabled, mutate])
 
   useMobileHeaderRight(
-    <Button variant="ghost" size="icon-sm" onClick={() => void load()} disabled={loading} aria-label={t("ecard.refresh")}>
-      <RefreshCw className={cn("size-4", loading && "animate-spin")} />
+    <Button variant="ghost" size="icon-sm" onClick={() => void load()} disabled={!enabled || loading} aria-label={t("ecard.refresh")}>
+      <RefreshCw className={cn(loading && "animate-spin")} />
     </Button>,
-    [loading, load, t]
+    [enabled, loading, load, t]
   )
+
+  if (!hasHydrated || (!!username && !isReady)) {
+    return (
+      <div className="flex flex-col gap-4 p-4">
+        <Skeleton className="h-36 w-full" />
+        <Skeleton className="h-24 w-full" />
+      </div>
+    )
+  }
 
   if (hasHydrated && !username) {
     return (
@@ -72,7 +105,7 @@ export default function EcardPage() {
     )
   }
 
-  if (noAuth) {
+  if (noAuth && !balance) {
     return (
       <div className="p-4">
         <Empty>
@@ -82,7 +115,7 @@ export default function EcardPage() {
             </EmptyMedia>
             <EmptyTitle>{t("ecard.noAuth")}</EmptyTitle>
           </EmptyHeader>
-          <Button variant="outline" onClick={() => void load()}>
+          <Button variant="outline" onClick={() => void load()} disabled={!enabled || loading}>
             {t("ecard.retry")}
           </Button>
         </Empty>
@@ -109,7 +142,7 @@ export default function EcardPage() {
             </EmptyMedia>
             <EmptyTitle>{error || t("ecard.notAvailable")}</EmptyTitle>
           </EmptyHeader>
-          <Button variant="outline" onClick={() => void load()}>
+          <Button variant="outline" onClick={() => void load()} disabled={!enabled || loading}>
             {t("ecard.retry")}
           </Button>
         </Empty>
@@ -119,6 +152,17 @@ export default function EcardPage() {
 
   return (
     <div className="flex flex-col gap-4 p-4">
+      <div className="hidden justify-end md:flex">
+        <Button variant="outline" onClick={() => void load()} disabled={loading}>
+          <RefreshCw data-icon="inline-start" className={cn(loading && "animate-spin")} />
+          {t("ecard.refresh")}
+        </Button>
+      </div>
+      {error && (
+        <Alert variant="destructive">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
       <Card className="overflow-hidden">
         <div className="bg-gradient-to-br from-primary/15 to-primary/5 p-6">
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -141,7 +185,7 @@ export default function EcardPage() {
           </div>
           <div className="flex items-center justify-between text-sm">
             <span className="text-muted-foreground">{t("ecard.cardStatus")}</span>
-            <span className="text-primary">{balance.cardStatusName}</span>
+            <span>{balance.cardStatusName}</span>
           </div>
         </CardContent>
       </Card>

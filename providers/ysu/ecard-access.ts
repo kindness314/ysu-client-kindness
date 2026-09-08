@@ -4,34 +4,55 @@
  * 复用教务 CAS 会话（authorize）免密建立 ehall 会话，查询一卡通余额。
  * 放在 providers/ysu 下以复用协议层的 jar/authorize。
  */
-import { getEcardBalance, resetEcard, type EcardBalance, type EcardSessionStatus } from "./protocol/ecard"
-import { isAuthenticated } from "./protocol/cas"
+import { getEcardBalance, EcardNotLoggedInError, EcardProtocolError, type EcardSessionStatus } from "./protocol/ecard"
+import { mapCASSessionError } from "./cas-auth"
+import { ProviderError, ProviderErrorCode, wrapError } from "../errors"
+import { useAuthStore } from "@/lib/stores/auth"
+import { getSchoolConfigScope } from "@/lib/server-config"
 
 export type { EcardBalance, EcardSessionStatus } from "./protocol/ecard"
 
-export class EcardAccessError extends Error {
-  constructor(message: string) {
-    super(message)
-    this.name = "EcardAccessError"
-  }
-}
 
-/** 登录态下查询一卡通余额。未登录/会话失效抛 EcardAccessError。 */
+/** 登录态下查询一卡通余额，复用 ProviderError 会话错误契约。 */
 export async function fetchEcardBalance(): Promise<EcardSessionStatus> {
-  if (!(await isAuthenticated())) {
-    throw new EcardAccessError("未登录教务，无法查询一卡通")
+  const { username, credential, isAuthenticated } = useAuthStore.getState()
+  const scope = getSchoolConfigScope()
+  if (!username || !credential || !isAuthenticated) {
+    throw new ProviderError(ProviderErrorCode.AUTH_REQUIRED, "请先登录后查询一卡通")
   }
   try {
-    return await getEcardBalance()
-  } catch (e) {
-    if (e instanceof Error && e.name === "EcardNotLoggedInError") {
-      throw new EcardAccessError("一卡通会话已过期，请重新登录")
+    const status = await getEcardBalance()
+    const current = useAuthStore.getState()
+    if (
+      current.username !== username ||
+      current.credential !== credential ||
+      !current.isAuthenticated ||
+      getSchoolConfigScope() !== scope
+    ) {
+      throw new ProviderError(ProviderErrorCode.AUTH_REQUIRED, "一卡通查询账户已切换")
     }
-    throw e
+    return status
+  } catch (e) {
+    let error = mapCASSessionError(e)
+    if (!error) {
+      if (e instanceof EcardNotLoggedInError) {
+        error = new ProviderError(ProviderErrorCode.AUTH_SESSION_EXPIRED, e.message, e, 401)
+      } else if (e instanceof EcardProtocolError) {
+        error = new ProviderError(ProviderErrorCode.BACKEND_PROTOCOL_ERROR, e.message, e, 500)
+      } else {
+        error = wrapError(e)
+      }
+    }
+    const current = useAuthStore.getState()
+    if (
+      error.code === ProviderErrorCode.AUTH_SESSION_EXPIRED &&
+      current.isAuthenticated &&
+      current.username === username &&
+      current.credential === credential &&
+      getSchoolConfigScope() === scope
+    ) {
+      current.setSessionExpired(true)
+    }
+    throw error
   }
-}
-
-/** 登出时清除 ehall 会话。 */
-export function clearEcardSession(): void {
-  resetEcard()
 }

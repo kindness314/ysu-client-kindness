@@ -1,122 +1,78 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useMemo } from "react"
+import useSWR from "swr"
 import { RefreshCw, Wallet } from "lucide-react"
-import { toast } from "sonner"
 import { Badge } from "@/components/ui/badge"
+import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Empty, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty"
-import { Input } from "@/components/ui/input"
 import { Separator } from "@/components/ui/separator"
 import { Skeleton } from "@/components/ui/skeleton"
 import { useTranslation } from "@/lib/i18n/use-translation"
 import { useAuthStore } from "@/lib/stores/auth"
-import { useSettingsStore } from "@/lib/stores/settings"
 import { useMobileHeaderRight } from "@/lib/stores/mobile-header"
-import { useStudentInfo } from "@/providers/hooks/use-student-info"
-import { EpayAccessError, fetchEpayPayments, type EpayRecord } from "@/providers/ysu/epay-access"
+import { fetchEpayPayments, type EpayRecord } from "@/providers/ysu/epay-access"
+import { ProviderError, ProviderErrorCode } from "@/providers/errors"
 import { toRecordStatus } from "@/providers/ysu/protocol/epay"
-import { EpayError, fetchEpayBills } from "@/lib/extras/epay/client"
+import { useProvider, useProviderReady } from "@/providers/use-provider"
+import { providerQueryKey } from "@/providers/hooks/use-provider-query"
+import { getSchoolConfigScope } from "@/lib/server-config"
 import { cn } from "@/lib/utils"
 
 export default function EpayPage() {
   const { t } = useTranslation()
+  const provider = useProvider()
+  const isReady = useProviderReady()
   const hasHydrated = useAuthStore((s) => s.hasHydrated)
   const username = useAuthStore((s) => s.username)
-  const epayAccount = useSettingsStore((s) =>
-    username ? s.epayAccountSettings[username] : undefined
-  )
-  const epayName = epayAccount?.name ?? ""
-  const setEpayName = useSettingsStore((s) => s.setEpayName)
-  const student = useStudentInfo()
-
-  const [records, setRecords] = useState<EpayRecord[] | null>(null)
-  const [unpaid, setUnpaid] = useState<EpayRecord[]>([])
-  const [error, setError] = useState<string | null>(null)
-  const [loading, setLoading] = useState(false)
-  const [updatedAt, setUpdatedAt] = useState<Date | null>(null)
-  const [nameInput, setNameInput] = useState("")
-  const [noAuth, setNoAuth] = useState(false)
-
-  // 姓名的最终取值：用户手动保存的覆盖 > 教务学生信息（无密码 fallback 用）
-  const effectiveName = (epayName.trim() || (student.data?.name ?? "").trim()).trim()
-
-  const load = useCallback(async () => {
-    if (!username) return
-    setLoading(true)
-    // 优先走 SSO：教务会话拉取全部付款记录（含已缴）
-    try {
+  const credential = useAuthStore((s) => s.credential)
+  const isAuthenticated = useAuthStore((s) => s.isAuthenticated)
+  const schoolConfigScope = getSchoolConfigScope()
+  const canQuery = isReady && hasHydrated && !!username && !!credential && isAuthenticated
+  const { data, error: queryError, isLoading, isValidating, mutate } = useSWR(
+    canQuery
+      ? providerQueryKey(provider.id, schoolConfigScope, username, "epay", { credential })
+      : null,
+    async () => {
+      const auth = useAuthStore.getState()
+      if (
+        auth.username !== username ||
+        auth.credential !== credential ||
+        getSchoolConfigScope() !== schoolConfigScope
+      ) {
+        throw new ProviderError(ProviderErrorCode.AUTH_REQUIRED, "缴费账号已切换")
+      }
       const status = await fetchEpayPayments()
-      setRecords(status.records)
-      setUnpaid(status.unpaid)
-      setError(null)
-      setNoAuth(false)
-      setUpdatedAt(new Date())
-    } catch (e) {
-      const isAuthErr = e instanceof EpayAccessError
-
-      // SSO 不可用时，使用姓名+学号执行无密码待缴查询兜底。
-      if (isAuthErr && effectiveName) {
-        try {
-          const bills = await fetchEpayBills(username, effectiveName)
-          setRecords(
-            bills.unpaid.map((b) => ({
-              id: b.id,
-              payName: b.payName,
-              chargeYear: "",
-              currencyTypeShow: "",
-              amountN: b.amount,
-              amount: String(b.amount),
-              payAmount: "",
-              refundAmount: "",
-              status: "1",
-              expired: "",
-              startTime: "",
-              overTime: "",
-            }))
-          )
-          setError(null)
-          setNoAuth(false)
-          setUpdatedAt(new Date())
-          return
-        } catch {
-          // 兜底查询失败时保留登录/姓名提示，允许用户再次重试。
-        }
+      const currentAuth = useAuthStore.getState()
+      if (
+        currentAuth.username !== username ||
+        currentAuth.credential !== credential ||
+        getSchoolConfigScope() !== schoolConfigScope
+      ) {
+        throw new ProviderError(ProviderErrorCode.AUTH_REQUIRED, "缴费账号已切换")
       }
-
-      if (isAuthErr) {
-        setNoAuth(true)
-        setRecords([])
-        setError(null)
-      } else {
-        setNoAuth(false)
-        const message = e instanceof EpayError ? e.message : t("epay.errorGeneric")
-        setError(t("epay.loadFailed", { message }))
-      }
-    } finally {
-      setLoading(false)
-    }
-  }, [username, effectiveName, t])
-
-  useEffect(() => {
-    setRecords(null)
-    setError(null)
-    setUpdatedAt(null)
-    setNoAuth(false)
-    setNameInput("")
-  }, [username])
-
-  useEffect(() => {
-    if (hasHydrated && username) void load()
-  }, [hasHydrated, username, load])
-
-  const saveNameAndReload = useCallback(() => {
-    const v = nameInput.trim()
-    if (!v || !username) return
-    setEpayName(username, v)
-    toast.success(t("epay.nameSaved"))
-  }, [nameInput, username, setEpayName, t])
+      return { status, updatedAt: new Date() }
+    },
+    { revalidateOnFocus: false, shouldRetryOnError: false }
+  )
+  const records: EpayRecord[] | null = data?.status.records ?? null
+  const unpaid = data?.status.unpaid ?? []
+  const updatedAt = data?.updatedAt
+  const loading = isLoading || isValidating
+  const noAuth = (queryError instanceof ProviderError && (
+    queryError.code === ProviderErrorCode.AUTH_REQUIRED ||
+    queryError.code === ProviderErrorCode.AUTH_SESSION_EXPIRED
+  )) || (hasHydrated && !!username && !credential)
+  const error = queryError
+    ? noAuth
+      ? t("epay.ssoUnavailable")
+      : t("epay.loadFailed", { message: t("epay.errorGeneric") })
+    : null
+  const load = useCallback(() => {
+    if (canQuery) void mutate().catch(() => undefined)
+  }, [canQuery, mutate])
 
   // 移动端刷新按钮入顶栏
   useMobileHeaderRight(
@@ -134,7 +90,7 @@ export default function EpayPage() {
 
   const paid = useMemo(() => records?.filter((r) => toRecordStatus(r) === "paid") ?? [], [records])
   // 待缴：以 index(我的待付款) 官方口径为准（协议层已按 overTime/status/expired 过滤）
-  const unpaidTotal = unpaid.reduce((s, r) => s + r.amountN, 0)
+  const unpaidTotal = unpaid.reduce((sum, record) => sum + Math.round(record.amountN * 100), 0) / 100
   const unpaidCount = unpaid.length
 
   if (hasHydrated && !username) {
@@ -152,8 +108,8 @@ export default function EpayPage() {
     )
   }
 
-  // SSO 不可用（未登录教务）时提示并允许用姓名兜底
-  if (noAuth) {
+  // 仅支持教务 SSO，不使用学号和姓名回退查询。
+  if (noAuth && !records) {
     return (
       <div className="p-4">
         <Empty>
@@ -163,29 +119,15 @@ export default function EpayPage() {
             </EmptyMedia>
             <EmptyTitle>{t("epay.ssoUnavailable")}</EmptyTitle>
           </EmptyHeader>
-          {!effectiveName && (
-            <div className="flex w-full max-w-sm flex-col gap-2">
-              <Input
-                value={nameInput}
-                onChange={(e) => setNameInput(e.target.value)}
-                placeholder={t("epay.namePlaceholder")}
-              />
-              <Button onClick={saveNameAndReload} disabled={!nameInput.trim()}>
-                {t("epay.nameSave")}
-              </Button>
-            </div>
-          )}
-          {effectiveName && (
-            <Button variant="outline" onClick={() => void load()}>
-              {t("epay.retry")}
-            </Button>
-          )}
+          <Button variant="outline" onClick={() => void load()} disabled={loading}>
+            {t("epay.retry")}
+          </Button>
         </Empty>
       </div>
     )
   }
 
-  if (!records && loading) {
+  if (!hasHydrated || !isReady || (!records && loading)) {
     return (
       <div className="flex flex-col gap-4">
         <Skeleton className="h-24 w-full" />
@@ -205,7 +147,7 @@ export default function EpayPage() {
             </EmptyMedia>
             <EmptyTitle>{error || t("epay.retry")}</EmptyTitle>
           </EmptyHeader>
-          <Button variant="outline" onClick={() => void load()}>
+          <Button variant="outline" onClick={() => void load()} disabled={loading}>
             {t("epay.retry")}
           </Button>
         </Empty>
@@ -237,6 +179,11 @@ export default function EpayPage() {
           {t("epay.refresh")}
         </Button>
       </div>
+      {error && (
+        <Alert variant="destructive">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
       <Card>
         <CardHeader>
           <CardTitle className="text-base">
@@ -247,9 +194,9 @@ export default function EpayPage() {
           </CardTitle>
         </CardHeader>
         <CardContent>
-          {unpaidCount === 0 ? (
+          {unpaidCount === 0 && records.length > 0 ? (
             <p className="text-sm text-muted-foreground">{t("epay.allPaid")}</p>
-          ) : (
+          ) : unpaidCount > 0 ? (
             <div className="flex flex-col gap-3">
               {unpaid.map((b, i) => (
                 <div key={`${b.id}-${i}`} className="flex items-start justify-between gap-3">
@@ -271,7 +218,7 @@ export default function EpayPage() {
                 </span>
               </div>
             </div>
-          )}
+          ) : null}
         </CardContent>
       </Card>
 

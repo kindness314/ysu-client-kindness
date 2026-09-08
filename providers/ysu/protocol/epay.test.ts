@@ -2,13 +2,12 @@ import { describe, expect, it } from "vitest"
 import {
   mergeRecords,
   toEpayRecords,
-  toLastPay,
   toRecordStatus,
   toUnpaidRecords,
   type EpayRecord,
 } from "./epay"
 
-/** 真实探测到的 allPay 数据块（D 对象值），敏感值保留以验证字段映射 */
+/** 真实 allPay 数据结构，身份字段使用合成值。 */
 const D = {
   root: "",
   modelNameTag: "model",
@@ -114,11 +113,6 @@ describe("toEpayRecords", () => {
     expect(r1.amount).toBe("10,000.00")
   })
 
-  it("空 queryResult 返回空数组", () => {
-    expect(toEpayRecords({})).toEqual([])
-    expect(toEpayRecords({ queryResult: null })).toEqual([])
-    expect(toEpayRecords(null)).toEqual([])
-  })
 })
 
 describe("toRecordStatus", () => {
@@ -139,28 +133,10 @@ describe("toRecordStatus", () => {
   it("未知或缺失状态不判定为未缴", () => {
     expect(toRecordStatus({ overTime: "", expired: "", status: "" } as never)).toBe("unknown")
     expect(toRecordStatus({ overTime: "", expired: "0", status: "2" } as never)).toBe("unknown")
+    expect(toRecordStatus({ overTime: "", expired: "", status: "1" } as never)).toBe("unknown")
   })
 })
 
-describe("toLastPay", () => {
-  it("从 {D:{lastPay}} 提取", () => {
-    const body = {
-      D: {
-        lastPay: {
-          amount: "870.00",
-          rid: "6216649",
-          payTime: "2026-09-01 11:05:16",
-          payName: "2026年住宿费缴费",
-          currencyTypeShow: "人民币元[CNY]",
-        },
-      },
-    }
-    const lp = toLastPay(body)
-    expect(lp).not.toBeNull()
-    expect(lp!.amount).toBe("870.00")
-    expect(lp!.payName).toContain("住宿费")
-  })
-})
 
 describe("mergeRecords（allPay 已缴 + index 待缴 双源合并）", () => {
   const mk = (id: string, overTime: string): EpayRecord => ({

@@ -22,7 +22,6 @@ export interface FeedbackHistoryItem {
 }
 
 interface EpayAccountSettings {
-  name: string
   lastCheckedAt: number
 }
 
@@ -60,7 +59,7 @@ interface SettingsState {
   analyticsPromptVersion: string
   feedbackIds: string[]
   feedbackHistory: FeedbackHistoryItem[]
-  /** 学费提醒账号设置，按学号隔离 */
+  /** 缴费提醒检查时间，按学号隔离 */
   epayAccountSettings: Record<string, EpayAccountSettings>
   /** 学费未缴自动提醒开关 */
   epayNotifyEnabled: boolean
@@ -98,7 +97,6 @@ interface SettingsState {
   setAnalyticsPromptVersion: (v: string) => void
   setFeedbackIds: (ids: string[]) => void
   setFeedbackHistory: (items: FeedbackHistoryItem[]) => void
-  setEpayName: (username: string, name: string) => void
   setEpayNotifyEnabled: (v: boolean) => void
   setEpayLastCheckedAt: (username: string, ts: number) => void
   setHasHydrated: (v: boolean) => void
@@ -177,23 +175,12 @@ export const useSettingsStore = create<SettingsState>()(
       setAnalyticsPromptVersion: (analyticsPromptVersion) => set({ analyticsPromptVersion }),
       setFeedbackIds: (feedbackIds) => set({ feedbackIds }),
       setFeedbackHistory: (feedbackHistory) => set({ feedbackHistory }),
-      setEpayName: (username, name) =>
-        set((state) => ({
-          epayAccountSettings: {
-            ...state.epayAccountSettings,
-            [username]: {
-              ...(state.epayAccountSettings[username] ?? { name: "", lastCheckedAt: 0 }),
-              name,
-            },
-          },
-        })),
       setEpayNotifyEnabled: (epayNotifyEnabled) => set({ epayNotifyEnabled }),
       setEpayLastCheckedAt: (username, ts) =>
         set((state) => ({
           epayAccountSettings: {
             ...state.epayAccountSettings,
             [username]: {
-              ...(state.epayAccountSettings[username] ?? { name: "", lastCheckedAt: 0 }),
               lastCheckedAt: ts,
             },
           },
